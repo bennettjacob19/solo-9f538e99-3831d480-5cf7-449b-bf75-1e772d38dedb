@@ -103,6 +103,36 @@ class SourceDB:
             )
             return [dict(zip(FIXED_COLUMNS, row)) for row in cur.fetchall()]
 
+    def snapshot_directory(self) -> tuple[list[dict[str, Any]], str]:
+        """一次性核验用：固定"整张制品目录 + 复制流边界"。
+
+        在一个短事务里以 REPEATABLE READ 取得一致性快照、读完整张目录后，
+        再取 pg_current_wal_lsn() 作为复制流边界：该 LSN 不早于快照中任何
+        已提交数据的 WAL 位置，因此复制流水位（watermark）越过它即代表
+        边界前的全部变更都已落入本地。事务随即结束，不在源表上持锁等待，
+        核验期间普通 SQL 可照常修改目录。返回 (目录行, 边界 LSN 文本)。
+        """
+        conn = psycopg2.connect(self._settings.pg_dsn)
+        try:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ"
+                )
+                cur.execute("SELECT pg_export_snapshot()")  # 固定一致性快照
+                cur.execute(
+                    "SELECT artifact_no, service_name, version, sha256"
+                    " FROM artifacts ORDER BY artifact_no"
+                )
+                rows = [dict(zip(FIXED_COLUMNS, r)) for r in cur.fetchall()]
+                # 读完目录再取边界，保证边界 >= 快照内全部数据对应的 WAL
+                cur.execute("SELECT pg_current_wal_lsn()::text")
+                boundary_lsn = cur.fetchone()[0]
+            conn.rollback()  # 只读事务，尽快释放快照，不长期占用源端资源
+            return rows, boundary_lsn
+        finally:
+            conn.close()
+
     # ------------------------------------------------------------- 复制槽
     def slot_exists(self, slot_name: str) -> bool:
         with self.connect() as conn, conn.cursor() as cur:

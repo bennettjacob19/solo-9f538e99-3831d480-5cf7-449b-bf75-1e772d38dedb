@@ -26,6 +26,13 @@ class Settings:
     # 直到基线落盘后才提交：确定性地构造"基线前开始、基线后提交"的事务。
     inflight_hook_no: int = int(_env("TEST_INFLIGHT_ARTIFACT_NO", "0"))
     inflight_hook_sleep_s: float = float(_env("TEST_INFLIGHT_SLEEP_S", "3"))
+    # 复制流泵在每条 walsender 连接建立后先暂停若干毫秒再开始读消息。
+    # 仅用于自测：确定性制造"复制积压/待捕获"窗口，网页与源库写入不受影响。
+    pump_pause_ms: int = int(_env("TEST_PUMP_PAUSE_MS", "0"))
+    # 复制流在尝试建立 walsender 连接之前先暂停若干毫秒（连接尚未建立，
+    # 源端任何数据都不可能进入客户端缓冲）。仅用于自测：确定性构造
+    # "核验等待期间源库不可达"的断连场景。
+    stream_connect_delay_ms: int = int(_env("TEST_STREAM_CONNECT_DELAY_MS", "0"))
 
     # ---- 本地历史库 SQLite ----
     sqlite_path: str = _env("SQLITE_PATH", "/tmp/capture/history.db")

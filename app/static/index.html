@@ -29,6 +29,10 @@
   .badge.STREAMING { background:#dafbe1; color:var(--ok); }
   .badge.INITIALIZING { background:#fff8c5; color:var(--warn); }
   .badge.ERROR { background:#ffebe9; color:var(--err); }
+  .badge.PENDING { background:#fff8c5; color:var(--warn); }
+  .badge.CONSISTENT { background:#dafbe1; color:var(--ok); }
+  .badge.DIVERGED { background:#ffebe9; color:var(--err); }
+  .badge.UNCONFIRMED { background:#f3f4f6; color:#656d76; }
   .muted { color:#656d76; font-size:12px; }
   .msg { margin-top:8px; font-size:13px; white-space:pre-wrap; }
   .msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
@@ -80,6 +84,16 @@
       <button onclick="loadHistory()">查询</button>
     </div>
     <div id="hist-wrap" style="margin-top:10px;"></div>
+  </section>
+
+  <section class="card full">
+    <h2>⑤ 一次性核验（捕获结果与源库是否一致）</h2>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <button class="primary" id="btn-verify" onclick="startVerification()">发起一次性核验</button>
+      <span class="muted">发起时固定源库整张目录与复制流边界；边界未完整落入显示“待捕获”，完成后按同一边界逐编号比较。等待期间可继续改目录，结论不受后续提交影响；中断显示“未确认”，可重新发起。</span>
+    </div>
+    <div class="msg" id="verify-msg"></div>
+    <div id="verify-wrap" style="margin-top:12px;"></div>
   </section>
 </main>
 
@@ -212,10 +226,84 @@ async function loadHistory(){
   } catch(e){ wrap.innerHTML='<div class="msg err">'+esc(e.message)+'</div>'; }
 }
 
+// ------------------------------------------------------------- 一次性核验
+const VERIFY_STATUS_TEXT = {
+  PENDING:'待捕获', CONSISTENT:'一致', DIVERGED:'不符', UNCONFIRMED:'未确认'
+};
+async function startVerification(){
+  const btn = document.getElementById('btn-verify');
+  btn.disabled = true;
+  try {
+    await getJSON('/api/verifications', {method:'POST'});
+    setMsg('verify-msg', '核验已发起：边界已固定，等待复制流完整落入…', 'ok');
+    await refreshVerifications();
+  } catch(e){
+    setMsg('verify-msg', '发起失败：'+e.message, 'err');
+  } finally { btn.disabled = false; }
+}
+function diffTable(rows, cols){
+  if (!rows || !rows.length) return '<span class="muted">无</span>';
+  const head = cols.map(c => `<th>${esc(c.title)}</th>`).join('');
+  const body = rows.map(r => '<tr>' + cols.map(c => {
+    const v = c.get ? c.get(r) : r[c.key];
+    return `<td>${c.code ? '<code>'+esc(v)+'</code>' : esc(v)}</td>`;
+  }).join('') + '</tr>').join('');
+  return `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+function renderVerification(v){
+  const pending = v.status === 'PENDING';
+  let detail = '';
+  if (v.status === 'UNCONFIRMED') {
+    detail = `<div class="msg err">中断原因：${esc(v.unconfirmed_reason || '未知')}。本次核验未得出结论，可重新发起。</div>`;
+  } else if (!pending) {
+    detail = `
+      <div style="margin:8px 0;">源目录 ${v.source_rows} 行，本地按同一边界重建 ${v.captured_rows ?? '-'} 行</div>
+      <h3 style="font-size:13px;margin:8px 0 4px;">缺失（源有 / 本地无）</h3>
+      ${diffTable(v.missing, [
+        {key:'artifact_no', title:'编号'}, {key:'service_name', title:'服务名'},
+        {key:'version', title:'版本'}, {key:'sha256', title:'SHA-256', code:true}])}
+      <h3 style="font-size:13px;margin:10px 0 4px;">额外（本地有 / 源无）</h3>
+      ${diffTable(v.extra, [
+        {key:'artifact_no', title:'编号'}, {key:'service_name', title:'服务名'},
+        {key:'version', title:'版本'}, {key:'sha256', title:'SHA-256', code:true}])}
+      <h3 style="font-size:13px;margin:10px 0 4px;">字段不符</h3>
+      ${diffTable(v.mismatches, [
+        {key:'artifact_no', title:'编号'},
+        {title:'字段', get:r => r.fields.map(f=>f.field).join(', ')},
+        {title:'源库值', get:r => r.fields.map(f=>f.field+'='+f.expected).join(' ; ')},
+        {title:'本地值', get:r => r.fields.map(f=>f.field+'='+f.actual).join(' ; ')}])}`;
+  }
+  return `
+  <div style="border:1px solid var(--bd); border-radius:8px; padding:10px 12px; margin-bottom:10px;">
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <span class="badge ${esc(v.status)}">${esc(VERIFY_STATUS_TEXT[v.status] || v.status)}</span>
+      <code>${esc(v.id)}</code>
+      <span class="muted">边界 LSN <code>${esc(v.boundary_lsn)}</code></span>
+      <span class="muted">发起 ${esc(v.created_at)}</span>
+      ${v.finished_at ? `<span class="muted">完成 ${esc(v.finished_at)}</span>` : ''}
+    </div>
+    ${detail}
+  </div>`;
+}
+async function refreshVerifications(){
+  const wrap = document.getElementById('verify-wrap');
+  try {
+    const r = await getJSON('/api/verifications');
+    if (!r.verifications.length) {
+      wrap.innerHTML = '<div class="muted">尚无核验记录</div>';
+      return;
+    }
+    wrap.innerHTML = r.verifications.map(renderVerification).join('');
+  } catch(e){
+    wrap.innerHTML = '<div class="msg err">'+esc(e.status===503 ? '捕获初始化未完成，暂不可核验' : e.message)+'</div>';
+  }
+}
+
 addOp('insert');
-refreshProgress(); refreshPoints();
+refreshProgress(); refreshPoints(); refreshVerifications();
 setInterval(refreshProgress, 3000);
 setInterval(refreshPoints, 5000);
+setInterval(refreshVerifications, 2000);
 </script>
 </body>
 </html>

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any
 
 import psycopg2
@@ -24,6 +25,7 @@ from .config import Settings
 from .decoder import parse_message
 from .source import SourceDB
 from .storage import PHASE_STREAMING, HistoryStore
+from .verification import evaluate_pending
 
 log = logging.getLogger("capture")
 
@@ -63,6 +65,16 @@ class CaptureWorker:
 
     # ----------------------------------------------------------------- main
     def _run(self) -> None:
+        # 应用（重新）启动：上一进程里未走完的核验无法保证原观察过程，
+        # 一律转"未确认"，值班工程师可在网页重新发起；已形成的结论不动。
+        marked = self._store.mark_pending_unconfirmed(
+            "应用重启，上一轮核验观察过程中断"
+        )
+        if marked:
+            log.warning(
+                "%d pending verification(s) marked UNCONFIRMED after restart",
+                marked,
+            )
         self._source.ensure_schema()
         state = self._store.get_state()
         if state.get("baseline_lsn"):
@@ -158,6 +170,12 @@ class CaptureWorker:
         backoff = max(1, self._settings.reconnect_backoff_s)
         transient_streak = 0  # 连续瞬断次数；未超阈值不降级为 ERROR
         while not self._stop.is_set():
+            # 测试钩子：连接建立前暂停（此时不存在 walsender，源端数据
+            # 无法进入客户端缓冲），用于确定性构造断连场景。默认关闭。
+            if self._settings.stream_connect_delay_ms:
+                self._stop.wait(
+                    self._settings.stream_connect_delay_ms / 1000.0
+                )
             repl_conn = None
             try:
                 if not self._source.slot_exists(slot):
@@ -181,14 +199,21 @@ class CaptureWorker:
                     self._store.mark_streaming()
                 else:
                     self._store.clear_error()
-                cur.consume_stream(
-                    lambda msg: self._handle_message(msg),
-                    keepalive_interval=self._settings.status_interval_s,
-                )
+                self._pump_stream(cur)
             except Exception as exc:
                 if self._stop.is_set():
                     break
                 transient_streak += 1
+                # 源断连即打断核验的连续观察：未完成核验立刻转"未确认"，
+                # 不等待重试结果，也不改动任何已形成的结论。
+                marked = self._store.mark_pending_unconfirmed(
+                    f"源库连接中断: {exc}"
+                )
+                if marked:
+                    log.warning(
+                        "%d pending verification(s) marked UNCONFIRMED"
+                        " after source disconnect", marked
+                    )
                 log.warning(
                     "replication stream broken (streak=%d): %r; reconnecting",
                     transient_streak, exc, exc_info=transient_streak >= 3,
@@ -207,12 +232,88 @@ class CaptureWorker:
                     except Exception:
                         pass
 
+    # ------------------------------------------------------------- streaming
+    def _pump_stream(self, cur: Any) -> None:
+        """自管复制流循环（替代 consume_stream 的阻塞 select）。
+
+        为什么不用 consume_stream：它在源库空闲时阻塞在 select 上，服务端
+        最长要等 wal_sender_timeout/2（默认约 30s）才自发发一次 keepalive，
+        核验流水位会长时间停滞。这里改为：
+        - 用 select 等 socket 可读（最多 1s，停止信号可及时打断），
+          再非阻塞排空 libpq 已缓冲的消息；
+        - 每 REPL_STATUS_INTERVAL_S 秒主动 send_feedback(reply=1)，
+          请求服务端**立即**回一条带当前 WAL 位置的 keepalive，
+          从而即使源库空闲，流水位也能秒级推进、核验不会干等。
+
+        psycopg2 的 read_message() 会在 C 层消费 Primary keepalive 但不向
+        Python 上抛（goto retry），不过它同时把 cursor.wal_end 更新为
+        keepalive 携带的服务端 WAL 位置——因此每轮循环都读 cur.wal_end
+        推进流水位，覆盖"消息被吞"的场景；XLogData 消息自身的 wal_end
+        也不小于该值，水位单调不减。
+        feedback 只携带已落盘提交点（flush_lsn），绝不确认未落盘更改。
+        """
+        import select
+
+        interval = max(1, self._settings.status_interval_s)
+        # 测试钩子：连接建立后先暂停，确定性制造复制积压（默认 0=关闭）
+        if self._settings.pump_pause_ms:
+            self._stop.wait(self._settings.pump_pause_ms / 1000.0)
+        last_feedback = time.monotonic()
+        while not self._stop.is_set():
+            # 非阻塞排空 libpq 已缓冲的消息（keepalive 在 C 层被消费，
+            # 不会返回，但会更新 cur.wal_end）
+            while True:
+                msg = cur.read_message()  # 无已缓冲消息返回 None
+                if msg is None:
+                    break
+                self._handle_message(msg)
+            # 关键：cur.wal_end 同时反映最近 XLogData 与被吞 keepalive 的
+            # 服务端 WAL 位置，用它推进核验流水位（0 表示尚未收到任何消息）。
+            if int(cur.wal_end) > 0:
+                self._store.update_stream_watermark(int(cur.wal_end))
+            evaluate_pending(self._store)
+            now = time.monotonic()
+            if now - last_feedback >= interval:
+                last_feedback = now
+                # reply=1：请服务端立刻回 keepalive，带回当前 WAL 位置；
+                # flush_lsn 用已落盘提交点，保持"先落盘后确认"不变量。
+                self._send_periodic_feedback(cur)
+            # 等 socket 可读或 1s 超时：既及时收到 keepalive，又能周期唤醒
+            try:
+                select.select([cur], [], [], 1.0)
+            except (OSError, ValueError):
+                # 连接关闭/文件描述符失效：下一轮 read_message 抛错，
+                # 由外层重连循环统一处理
+                if self._stop.wait(0.2):
+                    break
+
+    def _send_periodic_feedback(self, cur: Any) -> None:
+        state = self._store.get_state()
+        flush_text = state.get("last_commit_lsn")
+        kwargs: dict[str, Any] = {"reply": True}
+        if flush_text:
+            high, low = flush_text.split("/", 1)
+            kwargs["flush_lsn"] = (int(high, 16) << 32) | int(low, 16)
+        # 注意：send_feedback 的 C 签名不接受 None，无已落盘提交点时
+        # 省略 flush_lsn（协议默认 0，表示尚未确认任何事务）。
+        try:
+            cur.send_feedback(**kwargs)
+        except Exception:
+            # 连接问题交给外层重连循环处理，不在循环内吞错重启
+            log.debug("periodic feedback failed", exc_info=True)
+            raise
+
     def _handle_message(self, msg: Any) -> None:
         if self._stop.is_set():
             raise psycopg2.OperationalError("shutting down")
 
+        # 任何复制流消息（含无载荷 keepalive）都带服务端当前 WAL 位置；
+        # 用它推进流水位，使源库空闲时核验也能等到"边界完整落入"。
+        self._store.update_stream_watermark(int(msg.wal_end))
+
         if msg.data_start == 0:  # Primary keepalive 消息无载荷
             # 不主动确认：只随已落盘事务推进，绝不确认尚未落盘的更改
+            evaluate_pending(self._store)
             return
 
         data = msg.payload.decode("utf-8")
@@ -221,6 +322,7 @@ class CaptureWorker:
             # 无关消息（DDL/其他表/序列…）：不回送任何 feedback。
             # 槽位只随"已落盘事务"通过 send_feedback 推进，
             # 保证任何尚未落盘的更改都不会向源库确认。
+            evaluate_pending(self._store)
             return
 
         kind = parsed["kind"]
@@ -234,6 +336,8 @@ class CaptureWorker:
             # 提交记录结束位置，用作该提交点的 LSN。
             commit_lsn = msg.wal_end
             self._finish_transaction(parsed["xid"], commit_lsn, data, msg)
+            # 事务已落盘、流水位已推进：尝试让待捕获核验在此形成结论
+            evaluate_pending(self._store)
         self._store.update_last_message_lsn(str(msg.wal_end))
 
     def _finish_transaction(self, xid: int, commit_lsn: int,

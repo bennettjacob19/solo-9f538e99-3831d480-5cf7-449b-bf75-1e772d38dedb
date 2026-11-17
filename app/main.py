@@ -18,6 +18,12 @@ from .capture import CaptureWorker
 from .config import settings
 from .source import SourceDB, SourceError
 from .storage import HistoryStore, lsn_to_num
+from .verification import (
+    PendingVerificationConflict,
+    VerificationError,
+    evaluate_pending,
+    start_verification,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -176,3 +182,33 @@ def api_artifact_history(artifact_no: int) -> dict:
         "artifact_no": artifact_no,
         "history": store.get_history_of(artifact_no),
     }
+
+
+# ---------------------------------------------------------------- 一次性核验
+@app.post("/api/verifications")
+def api_create_verification() -> dict:
+    """发起一次性核验：固定源整目录快照与复制流边界（不锁源表、不改源数据）。"""
+    _require_ready()
+    try:
+        return start_verification(store, source)
+    except PendingVerificationConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    except VerificationError as exc:
+        # 源库不可达等：未产生任何核验记录
+        raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.get("/api/verifications")
+def api_list_verifications() -> dict:
+    """全部核验记录（只增）。读取时顺手评估一次，避免极端时序下结论滞后。"""
+    evaluate_pending(store)
+    return {"verifications": store.list_verifications()}
+
+
+@app.get("/api/verifications/{verification_id}")
+def api_get_verification(verification_id: str) -> dict:
+    evaluate_pending(store)
+    item = store.get_verification(verification_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="核验不存在")
+    return item
