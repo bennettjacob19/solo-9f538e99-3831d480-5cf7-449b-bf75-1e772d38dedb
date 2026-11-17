@@ -18,6 +18,7 @@ from .capture import CaptureWorker
 from .config import settings
 from .source import SourceDB, SourceError
 from .storage import HistoryStore, lsn_to_num
+from .verify import Verifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -75,10 +76,15 @@ class BatchRequest(BaseModel):
 store = HistoryStore(settings.sqlite_path)
 source = SourceDB(settings)
 worker = CaptureWorker(store, source, settings)
+verifier = Verifier(store, source)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 上次运行遗留的"待捕获"核验：应用重启即视为中断，标记为未确认
+    n = store.mark_pending_verifications_unconfirmed("应用重启，核验中断")
+    if n:
+        log.info("startup: %d pending verification(s) marked unconfirmed", n)
     worker.start()
     try:
         yield
@@ -176,3 +182,35 @@ def api_artifact_history(artifact_no: int) -> dict:
         "artifact_no": artifact_no,
         "history": store.get_history_of(artifact_no),
     }
+
+
+# ---------------------------------------------------------------- 一次性核验
+@app.post("/api/verifications", status_code=201)
+def api_start_verification() -> dict:
+    """发起一次性核验：固定源目录与复制流边界。需捕获链路就绪（STREAMING）。
+
+    发起后边界未完整落入 SQLite 时为"待捕获"，落入后按同一边界逐编号
+    比较并落终态；结论不随后续源库提交改变。
+    """
+    _require_ready()
+    try:
+        vid = verifier.start_verification()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"核验发起失败: {exc}")
+    store.try_complete_verification(vid)  # 边界可能已落入，立即出结论
+    return store.get_verification(vid)
+
+
+@app.get("/api/verifications")
+def api_list_verifications() -> dict:
+    store.complete_due_verifications()  # 兜底：完成边界已落入的核验
+    return {"verifications": store.list_verifications()}
+
+
+@app.get("/api/verifications/{vid}")
+def api_get_verification(vid: int) -> dict:
+    store.try_complete_verification(vid)
+    v = store.get_verification(vid)
+    if v is None:
+        raise HTTPException(status_code=404, detail="核验不存在")
+    return v

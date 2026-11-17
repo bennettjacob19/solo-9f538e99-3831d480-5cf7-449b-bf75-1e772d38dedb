@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from typing import Any, Iterator
 
@@ -11,6 +12,8 @@ import psycopg2
 import psycopg2.extras
 
 from .config import Settings
+
+log = logging.getLogger("source")
 
 FIXED_COLUMNS = ("artifact_no", "service_name", "version", "sha256")
 
@@ -159,3 +162,43 @@ class SourceDB:
             return rows
         finally:
             conn.close()
+
+    def drop_slot(self, slot_name: str) -> None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT pg_drop_replication_slot(%s)", (slot_name,))
+
+    def drop_slots_with_prefix(self, prefix: str) -> int:
+        """删除指定前缀的复制槽（清理核验临时槽残留），返回删除数量。"""
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT slot_name FROM pg_replication_slots"
+                " WHERE slot_name LIKE %s",
+                (prefix + "%",),
+            )
+            names = [r[0] for r in cur.fetchall()]
+            for name in names:
+                cur.execute("SELECT pg_drop_replication_slot(%s)", (name,))
+            return len(names)
+
+    def emit_boundary_marker(self, tag: str) -> None:
+        """提交一个空事务推动复制流前进（不改源目录）。
+
+        一次性核验用：让主流出现一个提交 LSN 大于核验边界的事务，保证
+        "边界完整落入 SQLite"的判定在源库静默时也能收敛。优先用
+        pg_logical_emit_message（PG14+，需超级用户）；权限不足时降级为
+        临时表空事务（catalog 变更同样产生提交记录，且提交后即删无残留）。
+        """
+        try:
+            with self.connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_logical_emit_message(true, 'verify_boundary', %s)",
+                    (tag,),
+                )
+            return
+        except Exception as exc:
+            log.info(
+                "pg_logical_emit_message 不可用（%s），降级为临时表空事务", exc
+            )
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute("CREATE TEMP TABLE _verify_marker(i int) ON COMMIT DROP")
+            cur.execute("INSERT INTO _verify_marker VALUES (1)")

@@ -274,6 +274,83 @@ echo "=== 7. 两侧持久化 ==="
 [ -f "$SQLDIR/history.db" ] && ok "SQLite 历史库落盘: $SQLDIR/history.db" || bad "SQLite 未落盘"
 [ -d "$PGDATA/pg_wal" ] && ok "PostgreSQL 数据目录持久化: $PGDATA" || bad "PG 数据目录缺失"
 
+# ------------------------------------------------------------- 8. 一次性核验
+echo "=== 8. 一次性核验：一致 / 并发修改 / 不一致 / 中断 ==="
+wait_phase STREAMING 15 || bad "场景 8 前置：应用未 STREAMING"
+wait_verify(){ # wait_verify <vid> <timeout_s>：轮询直到核验离开"待捕获"
+  local v=$1 deadline=$((SECONDS+$2)) s
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    s=$(api /api/verifications/$v | jq -r .status 2>/dev/null)
+    [ -n "$s" ] && [ "$s" != "PENDING_CAPTURE" ] && { echo "$s"; return 0; }
+    sleep 0.5
+  done
+  echo "PENDING_CAPTURE"; return 1
+}
+
+# 8.1 源库静默时发起核验也能收敛（标记事务推动复制流越过边界）；
+#     核验等待期间普通 SQL 继续改目录（核验不锁源表），该提交落在边界之后
+vid=$(curl -s -m 10 -X POST "$BASE/api/verifications" | jq -r .id)
+{ [ -n "$vid" ] && [ "$vid" != "null" ]; } && ok "核验已发起: #$vid" || bad "核验发起失败"
+curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
+ \"operations\":[{\"op\":\"insert\",\"artifact_no\":5001,\"service_name\":\"late\",\"version\":\"1\",\"sha256\":\"$SHA64\"}]}" >/dev/null
+st=$(wait_verify "$vid" 20)
+check "$st" "CONSISTENT" "并发修改下核验完成：源目录与捕获逐编号一致"
+check "$(api /api/verifications/$vid | jq '[.result.extra[]?]|length')" "0" "边界后的提交（5001）不计入本次核验"
+sleep 2
+check "$(api /api/history/5001 | jq '[.history[]|select(.change_type=="INSERT")]|length')" "1" "核验不影响捕获链路：5001 仍被正常捕获"
+
+# 8.2 后续提交不改变已完成核验的结论
+curl -s -X POST "$BASE/api/source/operations" -H 'Content-Type: application/json' -d "{
+ \"operations\":[{\"op\":\"update\",\"artifact_no\":1001,\"service_name\":\"billing-gateway\",\"version\":\"10.0.0\",\"sha256\":\"$SHA64\"}]}" >/dev/null
+sleep 2
+check "$(api /api/verifications/$vid | jq -r .status)" "CONSISTENT" "后续提交不改变已完成核验的结论"
+
+# 8.3 篡改历史 -> DIVERGED，并定位到编号与字段
+SQLITE_DB="$SQLDIR/history.db" python3 - <<'PY'
+import os, sqlite3
+c = sqlite3.connect(os.environ["SQLITE_DB"])
+c.execute("UPDATE artifact_history SET version='tampered' WHERE id=(SELECT MAX(id) FROM artifact_history WHERE artifact_no=1001)")
+c.commit(); c.close()
+PY
+vid2=$(curl -s -m 10 -X POST "$BASE/api/verifications" | jq -r .id)
+st2=$(wait_verify "$vid2" 20)
+check "$st2" "DIVERGED" "篡改历史后核验判定不一致"
+check "$(api /api/verifications/$vid2 | jq '[.result.mismatch[]?|select(.artifact_no==1001)]|length')" "1" "字段不符定位到编号 1001"
+check "$(api /api/verifications/$vid2 | jq -r '.result.mismatch[]?|select(.artifact_no==1001)|.fields.version.captured')" "tampered" "不符字段值来自捕获侧"
+SQLITE_DB="$SQLDIR/history.db" python3 - <<'PY'
+import os, sqlite3
+c = sqlite3.connect(os.environ["SQLITE_DB"])
+c.execute("UPDATE artifact_history SET version='10.0.0' WHERE artifact_no=1001 AND version='tampered'")
+c.commit(); c.close()
+PY
+
+# 8.4 应用重启 -> 中断的核验显示未确认（构造长期待捕获核验，避免时序赛跑）
+vid3=$(SQLITE_DB="$SQLDIR/history.db" python3 - <<'PY'
+import os, sqlite3
+c = sqlite3.connect(os.environ["SQLITE_DB"])
+c.execute("INSERT INTO verifications(created_at,boundary_lsn,boundary_lsn_num,status,source_row_count) VALUES ('2026-01-01T00:00:00Z','FF/0',?,'PENDING_CAPTURE',0)", (1<<40,))
+c.commit(); print(c.execute("SELECT MAX(id) FROM verifications").fetchone()[0]); c.close()
+PY
+)
+kill -9 "$(app_pid)" 2>/dev/null || true; sleep 2
+start_app "$SQLDIR"
+wait_phase STREAMING 15 || true
+check "$(api /api/verifications/$vid3 | jq -r .status)" "UNCONFIRMED" "应用重启后中断的核验显示未确认"
+
+# 8.5 源断连 -> 待捕获核验显示未确认
+vid4=$(SQLITE_DB="$SQLDIR/history.db" python3 - <<'PY'
+import os, sqlite3
+c = sqlite3.connect(os.environ["SQLITE_DB"])
+c.execute("INSERT INTO verifications(created_at,boundary_lsn,boundary_lsn_num,status,source_row_count) VALUES ('2026-01-01T00:00:00Z','FF/0',?,'PENDING_CAPTURE',0)", (1<<40,))
+c.commit(); print(c.execute("SELECT MAX(id) FROM verifications").fetchone()[0]); c.close()
+PY
+)
+check "$(api /api/verifications/$vid4 | jq -r .status)" "PENDING_CAPTURE" "构造的核验在断连前处于待捕获"
+pg_ctl_q restart -w >/dev/null
+sleep 3
+check "$(api /api/verifications/$vid4 | jq -r .status)" "UNCONFIRMED" "源断连后待捕获核验显示未确认"
+wait_phase STREAMING 15 || true
+
 echo
 echo "================ 自测结果: $PASS passed / $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

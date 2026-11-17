@@ -29,6 +29,10 @@
   .badge.STREAMING { background:#dafbe1; color:var(--ok); }
   .badge.INITIALIZING { background:#fff8c5; color:var(--warn); }
   .badge.ERROR { background:#ffebe9; color:var(--err); }
+  .badge.PENDING_CAPTURE { background:#fff8c5; color:var(--warn); }
+  .badge.CONSISTENT { background:#dafbe1; color:var(--ok); }
+  .badge.DIVERGED { background:#ffebe9; color:var(--err); }
+  .badge.UNCONFIRMED { background:#eaeef2; color:#656d76; }
   .muted { color:#656d76; font-size:12px; }
   .msg { margin-top:8px; font-size:13px; white-space:pre-wrap; }
   .msg.ok { color:var(--ok); } .msg.err { color:var(--err); }
@@ -80,6 +84,17 @@
       <button onclick="loadHistory()">查询</button>
     </div>
     <div id="hist-wrap" style="margin-top:10px;"></div>
+  </section>
+
+  <section class="card full">
+    <h2>⑤ 一次性核验：捕获结果与源库目录比对</h2>
+    <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+      <button class="primary" onclick="startVerification()">发起核验</button>
+      <span class="muted">发起时固定源库整张目录与复制流边界；边界未落入 SQLite 显示"待捕获"，
+        落入后按同一边界逐编号比较；结论不随后续提交改变，核验不改写源目录与已有历史。</span>
+    </div>
+    <div class="msg" id="verify-msg"></div>
+    <div id="verify-list" style="margin-top:10px;"></div>
   </section>
 </main>
 
@@ -212,10 +227,67 @@ async function loadHistory(){
   } catch(e){ wrap.innerHTML='<div class="msg err">'+esc(e.message)+'</div>'; }
 }
 
+// ---------------------------------------------------------------- 一次性核验
+const VSTATUS = {
+  PENDING_CAPTURE: '待捕获', CONSISTENT: '一致',
+  DIVERGED: '不一致', UNCONFIRMED: '未确认',
+};
+async function startVerification(){
+  setMsg('verify-msg','核验发起中（固定源目录与复制流边界）…');
+  try {
+    const v = await getJSON('/api/verifications', {method:'POST'});
+    setMsg('verify-msg', `核验 #${v.id} 已发起，复制流边界 ${v.boundary_lsn}`, 'ok');
+    refreshVerifications();
+  } catch(e){ setMsg('verify-msg', '发起失败：'+e.message, 'err'); }
+}
+async function refreshVerifications(){
+  try {
+    const r = await getJSON('/api/verifications');
+    renderVerifications(r.verifications);
+  } catch(e){ /* 列表刷新失败静默，下轮重试 */ }
+}
+function renderVerifications(list){
+  const wrap = document.getElementById('verify-list');
+  if (!list.length){ wrap.innerHTML='<div class="muted">暂无核验记录</div>'; return; }
+  wrap.innerHTML = list.map(v => {
+    const label = VSTATUS[v.status] || v.status;
+    let body = '';
+    if (v.status === 'CONSISTENT')
+      body = `<div class="msg ok">源目录与捕获结果逐编号完全一致（${v.source_row_count} 行）。</div>`;
+    else if (v.status === 'DIVERGED')
+      body = renderDiverged(v.result);
+    else if (v.status === 'UNCONFIRMED')
+      body = `<div class="muted">核验被中断（${esc(v.result?.reason || '源断连或应用重启')}），结论未确认，可重新发起。</div>`;
+    else
+      body = '<div class="muted">等待复制流边界完整落入 SQLite…（期间源库可正常改目录）</div>';
+    return `<div class="card" style="margin-bottom:8px; background:var(--bg);">
+      <div><b>核验 #${v.id}</b> &nbsp;<span class="badge ${v.status}">${label}</span></div>
+      <div class="kv" style="margin-top:6px;">
+        <div>发起时间</div><div>${esc(v.created_at)}</div>
+        <div>复制流边界</div><div><code>${esc(v.boundary_lsn)}</code></div>
+        <div>源目录行数</div><div>${v.source_row_count}</div>
+        ${v.completed_at ? `<div>完成时间</div><div>${esc(v.completed_at)}</div>` : ''}
+      </div>${body}</div>`;
+  }).join('');
+}
+function renderDiverged(res){
+  if (!res) return '<div class="msg err">不一致（无明细）</div>';
+  let h = '<div class="msg err">捕获结果与源目录不一致：</div><ul style="font-size:13px; margin:6px 0;">';
+  if (res.missing?.length) h += `<li>缺失（源有、捕获无）编号：${res.missing.join(', ')}</li>`;
+  if (res.extra?.length) h += `<li>额外（捕获有、源无）编号：${res.extra.join(', ')}</li>`;
+  for (const m of (res.mismatch || [])){
+    const fs = Object.entries(m.fields).map(([f,d]) =>
+      `${f}：源=<code>${esc(d.source)}</code> 捕获=<code>${esc(d.captured)}</code>`).join('；');
+    h += `<li>编号 ${m.artifact_no} 字段不符：${fs}</li>`;
+  }
+  return h + '</ul>';
+}
+
 addOp('insert');
-refreshProgress(); refreshPoints();
+refreshProgress(); refreshPoints(); refreshVerifications();
 setInterval(refreshProgress, 3000);
 setInterval(refreshPoints, 5000);
+setInterval(refreshVerifications, 3000);
 </script>
 </body>
 </html>

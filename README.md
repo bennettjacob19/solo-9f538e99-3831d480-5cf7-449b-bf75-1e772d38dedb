@@ -32,13 +32,41 @@ SQLite 历史库（WAL，仅增不改）  ←→  FastAPI 网页 / JSON API
 | 不确认尚未落盘的更改 | 严格“先 SQLite commit，后 `send_feedback(flush_lsn=...)`”；keepalive 与无关消息一律不回送反馈。自测断言槽 `confirmed_flush_lsn` 永不超前已落盘提交点 |
 | 初始化未完成不开放历史 | 状态机 `INITIALIZING → STREAMING / ERROR`；未到 STREAMING 时 `/api/points`、`/api/directory`、`/api/history/*` 一律 503 |
 | 固定结构的增改删 | 网页/API 只接受 `insert/update/delete` 三类操作，pydantic 判别联合按 `op` 分流，仅四列，sha256 强制 64 位十六进制；无任何 DDL/任意 SQL 通道 |
+| 一次性核验与源库一致 | 发起时建**临时**复制槽导出一致性快照，固定整表源目录与复制流边界 `B`（与基线同一机制，严格对齐）；随后立即删槽，只读快照不锁源表。边界未完整落入 SQLite 显示"待捕获"，落入后按同一 `B` 逐编号比较，结论落盘即为终态，后续提交不改变 |
 
 ### SQLite 表结构（`/data/history.db`）
 
 - `capture_state`：阶段、槽名、基线 LSN、最近提交点/消息 LSN、错误信息。
-- `txns`：源事务 xid（主键）、提交 LSN、提交时间。
+- `txns`：源事务 xid（主键）、提交 LSN、提交时间，以及真实提交 LSN
+  `commit_record_lsn_num`（COMMIT 消息的 `data_start`，供核验边界比较）。
 - `artifact_history`：仅增变更链（BASELINE/INSERT/UPDATE/DELETE），带 xid、
   提交 LSN 与数值化 LSN，支持按提交点过滤与编号重建。
+- `verifications`：一次性核验（边界 LSN、状态机、比较结果），仅增不改。
+- `verification_rows`：发起核验时固定的源目录整表快照。
+
+### 一次性核验的一致性设计
+
+值班工程师确认"捕获结果与源库一致"时，难点在于：源库在核验期间仍在被
+普通 SQL 修改，且不能为核验长时间锁表。本设计把"固定"与"比较"都锚定在
+同一个复制流边界 `B` 上：
+
+1. **固定（发起）**：建一个临时逻辑复制槽，其 `consistent_point` 与
+   `pg_export_snapshot` 的一致性快照严格对齐，作为边界 `B`；用该快照读
+   整张源目录存入 `verification_rows`，随后立即删临时槽。全程 MVCC 快照
+   读，不持有快照、不锁源表，核验等待期间普通 SQL 可继续改目录。
+2. **收敛（等待）**：提交一个空标记事务（`pg_logical_emit_message`，不改
+   源目录），其提交 LSN > `B`，推动主复制流前进，保证源库静默时
+   "边界落入"判定也能收敛。捕获线程按 LSN 顺序落盘，当已落盘事务的最大
+   真实提交 LSN 达到 `B` 时，`B` 之前的所有事务必然都已落盘。
+3. **比较（落终态）**：用同一 `B` 重建捕获侧目录（`<= B` 的仅增历史），
+   与固定的源目录逐编号比较，列出缺失（源有捕获无）、额外（捕获有源无）、
+   字段不符（同编号但 service_name/version/sha256 不同）；全部相同才判
+   "一致"。结论基于 `<= B` 的历史，该历史不再变化，故结论为终态，
+   后续提交（LSN > `B`）不改变它。
+4. **中断（未确认）**：应用重启（启动时）或源复制连接中断（捕获线程
+   异常）时，仍处于"待捕获"的核验被标记为"未确认"，可重新发起；已完成
+   的核验结论不受影响。核验只读源目录、不改写已有历史（仅新增核验记录
+   与一个 0 变更的标记事务提交点）。
 
 ## 2. 用 Docker Compose 启动（交付方式）
 
@@ -65,7 +93,10 @@ docker compose up --build
 3. **提交点回看**：列出 BASELINE 与每个源事务提交点（LSN、xid、时间、
    变更行数），点击任一行即查看该时刻整张目录。
 4. **单编号完整历史**：含 BASELINE/INSERT/UPDATE/DELETE 全链，
-   直观验证“删除后重用编号，旧历史保留”。
+   直观验证”删除后重用编号，旧历史保留”。
+5. **一次性核验**：一键发起核验，列表展示每次核验的边界 LSN、源目录行数
+   与状态徽章（待捕获/一致/不一致/未确认）；不一致时展开缺失、额外与
+   字段不符明细，3 秒自动刷新直至出结论。
 
 ## 4. HTTP API
 
@@ -77,6 +108,9 @@ docker compose up --build
 | GET | `/api/points` | 全部可查询提交点（未就绪时 503） |
 | GET | `/api/directory?point=0/16B3748` | 该提交点（含）的整目录 |
 | GET | `/api/history/{artifact_no}` | 单编号完整变更链 |
+| POST | `/api/verifications` | 发起一次性核验（需 STREAMING），返回核验记录 |
+| GET | `/api/verifications` | 全部核验列表（触发边界已落入的核验完成） |
+| GET | `/api/verifications/{id}` | 单个核验状态与比较结果 |
 
 请求示例：
 
@@ -124,9 +158,12 @@ bash tests/selftest.sh
 6. `kill -9` 强杀应用后重启：事务数不重复、最后更新仍在、
    槽 `confirmed_flush_lsn` 不超前已落盘 LSN、续接后新变更继续捕获；
 7. 源 PostgreSQL 重启后应用自动重连恢复 STREAMING，恢复后变更不丢；
-8. SQLite 与 PostgreSQL 数据目录均落盘持久化。
+8. SQLite 与 PostgreSQL 数据目录均落盘持久化；
+9. **一次性核验**：源库静默时发起也能收敛（标记事务推动）、等待期间并发
+   改目录不影响结论、后续提交不改变已完成结论、篡改历史被判定不一致并
+   定位到编号与字段、应用重启与源断连后中断的核验显示未确认。
 
-最近一次结果：**30 passed / 0 failed**。
+最近一次结果：**41 passed / 0 failed**。
 
 ## 6. 配置（环境变量）
 
@@ -150,6 +187,16 @@ bash tests/selftest.sh
   需更换存储层。
 - 复制槽若被人工从源库删除，应用进入 ERROR 并在 `/api/progress` 暴露，
   不会自动重建（重建会使旧 LSN 失效，需人工确认后清空历史库重新基线）。
+- 一次性核验发起时需建临时复制槽，要求源库 `wal_level=logical` 且有空闲
+  复制槽；临时槽建后即删，若应用在删槽前崩溃，残留槽会在下次发起时按
+  `verify_tmp_` 前缀清理。
+- 核验的标记事务优先用 `pg_logical_emit_message`（需超级用户）；权限不足
+  时降级为临时表空事务。若两者都不可用，核验仍能发起，但"边界落入"需等待
+  源库自然事务越过边界（静默源库会延长"待捕获"）。Compose 与自测均用
+  `postgres` 超级用户，标记事务可用。
+- 升级前捕获的历史事务无"真实提交 LSN"（`commit_record_lsn_num` 为 NULL），
+  核验边界比较时回退 `wal_end`（上界）。核验边界是发起时刻，其附近事务均
+  为升级后捕获并带精确值，故对结论的实际影响可忽略。
 - 沙箱环境未提供 Docker，Compose 文件未经本机 `docker compose` 实跑，
   但应用本体已用同等配置在本机 PostgreSQL 15 + uvicorn 下完成全部端到端
   验证；Compose 镜像基于官方 `python:3.12-slim` 与 `postgres:16-bookworm`。

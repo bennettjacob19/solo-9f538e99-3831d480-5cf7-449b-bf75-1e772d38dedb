@@ -193,6 +193,10 @@ class CaptureWorker:
                     "replication stream broken (streak=%d): %r; reconnecting",
                     transient_streak, exc, exc_info=transient_streak >= 3,
                 )
+                # 源复制连接中断：尚未完成的核验无法确认，标记为未确认
+                self._store.mark_pending_verifications_unconfirmed(
+                    "源复制连接中断，核验未能确认"
+                )
                 # 应用刚重启时旧 walsender 释放槽位有短暂延迟，属可恢复瞬断：
                 # 保留 STREAMING，历史查询继续可用；连续失败才降级为 ERROR。
                 if transient_streak >= 3:
@@ -230,14 +234,18 @@ class CaptureWorker:
         elif kind == "CHANGE":
             self._current_changes.append(parsed)
         elif kind == "COMMIT":
-            # test_decoding: COMMIT 行本身不带 LSN，消息 wal_end 即该事务
-            # 提交记录结束位置，用作该提交点的 LSN。
+            # wal_end 用作提交点展示/排序；data_start 是该事务提交记录的
+            # 真实 LSN，供一次性核验做"边界是否落入"与目录重建比较。
             commit_lsn = msg.wal_end
-            self._finish_transaction(parsed["xid"], commit_lsn, data, msg)
+            commit_record_lsn = msg.data_start
+            self._finish_transaction(
+                parsed["xid"], commit_lsn, commit_record_lsn, data, msg
+            )
         self._store.update_last_message_lsn(str(msg.wal_end))
 
     def _finish_transaction(self, xid: int, commit_lsn: int,
-                            raw_commit_msg: str, msg: Any) -> None:
+                            commit_record_lsn: int, raw_commit_msg: str,
+                            msg: Any) -> None:
         changes = getattr(self, "_current_changes", [])
         # include-timestamp=1 时形如 "COMMIT 12345 (at 2026-11-16 10:00:00.0+00)"
         commit_ts = None
@@ -247,13 +255,15 @@ class CaptureWorker:
 
         lsn_text = f"{commit_lsn >> 32:X}/{commit_lsn & 0xFFFFFFFF:08X}"
         written = self._store.persist_transaction(
-            xid, lsn_text, commit_ts, changes
+            xid, lsn_text, commit_ts, changes, commit_record_lsn
         )
         if written:
             log.info(
                 "txn %s persisted at %s with %d change(s)",
                 xid, lsn_text, len(changes),
             )
+            # 新事务落盘可能使某些"待捕获"核验的边界完整落入，尝试完成它们
+            self._store.complete_due_verifications()
         else:
             log.info("txn %s replayed after restart, skipped (idempotent)", xid)
 
